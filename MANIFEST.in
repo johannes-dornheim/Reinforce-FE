@@ -1,0 +1,3 @@
+recursive-include gym_fem/assets *
+recursive-include gym_fem/simulation_scripts *
+include gym_fem/config.ini
