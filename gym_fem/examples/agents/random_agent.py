@@ -31,7 +31,7 @@ if __name__ == '__main__':
     # directory, including one with existing data -- all monitor files
     # will be namespaced). You can also dump to a tempdir if you'd
     # like: tempfile.mkdtemp().
-    outdir = '/tmp/random-agent-results'
+    outdir = '/tmp/gym_fem/random-agent-results'
     env = wrappers.Monitor(env, directory=outdir, video_callable=False, write_upon_reset=True, force=True)
     env = FEMCSVLogger(env, outdir=outdir)
     # env = PseudoContinuousActions(env)

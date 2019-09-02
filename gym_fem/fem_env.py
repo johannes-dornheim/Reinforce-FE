@@ -83,7 +83,7 @@ class FEMEnv(gym.Env, ABC):
         # determine paths for current environment
         if self.persistent_simulation:
             if storage in [None, '', 'None']:
-                self.sim_storage = Path(__file__).parent.joinpath(f'sim_storage/{self.ENV_ID}')
+                self.sim_storage = Path(f'/tmp/gym_fem/{self.ENV_ID}')
             else:
                 self.sim_storage = Path(f'{storage}/{self.ENV_ID}')
         else:
