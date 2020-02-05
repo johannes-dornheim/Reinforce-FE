@@ -14,7 +14,7 @@ A collection of Reinforcement Learning environments based on physical simulation
 ### prerequisites
 - Linux OS (tested on Ubuntu, Mint)
 - Python 3
-- For the Deep-Drawing Environments: Abaqus (Version 6.14)
+- For the Deep-Drawing Environments: Abaqus (Tested on V. 6.14), Student Version should be sufficient
 
 ### Installation
 
