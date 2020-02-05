@@ -1,7 +1,17 @@
 # Reinforce-FE
 A collection of Reinforcement Learning environments based on physical simulations and supporting the "openAI Gym" environment API
-## Installation
-### Abaqus
+## Setup
+### prerequisites
+- Linux OS (tested on Ubuntu, Mint)
+- Python 3
+- For the Deep-Drawing Environments: Abaqus (Version 6.14)
+
+### Installation
+"""
+git clone https://github.com/johannes-dornheim/Reinforce-FE
+cd Reinforce-FE
+pip install -e .
+"""
 ## Features
 ## Usage
 ## Publications
