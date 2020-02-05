@@ -7,11 +7,13 @@ A collection of Reinforcement Learning environments based on physical simulation
 - For the Deep-Drawing Environments: Abaqus (Version 6.14)
 
 ### Installation
-"""
+
+```
 git clone https://github.com/johannes-dornheim/Reinforce-FE
 cd Reinforce-FE
 pip install -e .
-"""
+```
+
 ## Features
 ## Usage
 ## Publications
