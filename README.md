@@ -23,6 +23,13 @@ git clone https://github.com/johannes-dornheim/Reinforce-FE
 cd Reinforce-FE
 pip install -e .
 ```
+Test the installation of Reinforce-FE and Abaqus modules:
+```
+cd examples/agents
+python random_agent.py
+```
+should run the random-agent on the 5 time-step Deep-Drawing environment.
+
 
 ## Features
 ## Usage
