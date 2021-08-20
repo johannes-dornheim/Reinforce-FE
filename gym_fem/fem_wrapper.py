@@ -100,7 +100,7 @@ class SimulationError(Exception):
 
 class AbaqusWrapper(FEMWrapper):
     def __init__(self, simulation_store_path, template_path, abaq_command, abaq_version_string,
-                 cpu_count, abaq_timeout, reader_version):
+                 cpu_count, abaq_timeout, reader_version, abaq_forcekill=False):
         super().__init__(simulation_store_path)
         self.template_folder = template_path
 
@@ -117,13 +117,17 @@ class AbaqusWrapper(FEMWrapper):
         self.cpu_count = cpu_count
         self.timeout = abaq_timeout
         self.abaq_reader_version = reader_version
-
+        self.abaq_forcekill = abaq_forcekill
         self.result_dict = {}
         self.NON_SIMABLE_ERR_MESSAGES = ["Abaqus/Standard Analysis exited with an error",
                                          "aborted with system error code 1073741819",
                                          "Analysis Input File Processor exited with an error"]
         self.CONNECTION_ERR_MESSAGES = ["IP address cannot be determined",
                                         "Failed to startup licensing"]
+        if abaq_forcekill:
+            warnings.warn("Abaqus Forcekill (abaq_forcekill) is an experimental feature that should be used only if it "
+                          "is absolutely necessary. In particular, it should not be combined with simulation "
+                          "parallelism!")
 
     def request_lock(self, simulation_id, timeout_seconds=600):
         return super().request_lock(simulation_id, timeout_seconds)
@@ -193,7 +197,7 @@ class AbaqusWrapper(FEMWrapper):
         out = ""
         try_count = 0
 
-        while f"Abaqus JOB {simulation_id} COMPLETED" not in out or \
+        while f"Abaqus JOB {simulation_id} COMPLETED" not in str(out) or \
                 job_directory.joinpath(f'{simulation_id}.odb_f').exists():
             # delete all job-files except .inp
             for file in [f for f in job_directory.iterdir() if f.stem == simulation_id and f.suffix != '.inp']:
@@ -207,13 +211,37 @@ class AbaqusWrapper(FEMWrapper):
             try_count += 1
             try:
                 start = time.time()
-                out = check_output(run_cmd, cwd=job_directory, timeout=self.timeout, stderr=subprocess.STDOUT)
+                if not self.abaq_forcekill:
+                    out = check_output(run_cmd, cwd=job_directory, timeout=self.timeout, stderr=subprocess.STDOUT)
+                else:
+                    # === dirty hack due to linux abq termination problem! ===
+                    if 'interactive' in run_cmd:
+                        run_cmd.remove('interactive')
+                    print(run_cmd)
+                    out = check_output(run_cmd, cwd=job_directory, timeout=self.timeout, stderr=subprocess.STDOUT)
+                    analysis_finished = False
+                    while not analysis_finished:
+                        try:
+                            with open(job_directory.joinpath(f'{simulation_id}.sta'), 'r') as f:
+                                lines = f.read().splitlines()
+                                analysis_finished = "COMPLETED SUCCESSFULLY" in lines[-2] + lines[-1]
+                            time.sleep(1)
+                        except IOError:
+                            time.sleep(2)
+                        if time.time() > start + self.timeout:
+                            raise TimeoutError('abq timeout')
+
+                    subprocess.call('pgrep standard | xargs kill', shell=True)
+                    out = f"Abaqus JOB {simulation_id} COMPLETED"
+                    job_directory.joinpath(f'{simulation_id}.lck').unlink()
+                    # === end of dirty hack ===
+
                 out = str(out)
                 logging.info(out)
                 if 'Position in the queue' in out:
                     logging.warning("Abaqus licence-request was queued. " +
                                     f"Total time for solving: {time.time() - start} seconds.")
-            except TimeoutExpired:
+            except (TimeoutExpired, TimeoutError):
                 logging.warning(f'Abaqus Timed out after {self.timeout} seconds.')
             except CalledProcessError as e:
                 out = str(e.output).replace('\\r\\n', ' || ')
@@ -225,8 +253,8 @@ class AbaqusWrapper(FEMWrapper):
                     if try_count % 2 == 0:
                         raise SimulationError
                 time.sleep(30)
-            except Exception as e:
-                logging.warning(f'Unhandled Abaqus Error {e} abaqus output: {out}')
+            #except Exception as e:
+            #    logging.warning(f'Unhandled Abaqus Error {e} abaqus output: {out}')
         """ clean base-job files """
         if is_restart_simulation:
             for file in [job_directory.joinpath(f) for f in base_job_file_names]:
@@ -272,7 +300,7 @@ class AbaqusWrapper(FEMWrapper):
         # read out results from odb if not already done
         if not (node_csv.exists() and element_csv.exists()):
             # create reader-script command
-            reader_script = 'AbaqReader.py'
+            reader_script = 'AbaqStrainStressReader.py'
 
             odb_path = job_directory.joinpath(f'{simulation_id}.odb')
             read_cmd = [f'{self.abaq_command}', 'python', reader_script, f'{odb_path}', f'{job_directory}']

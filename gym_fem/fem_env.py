@@ -113,7 +113,8 @@ class FEMEnv(gym.Env, ABC):
                                              abaq_params.get('abaq_version'),
                                              abaq_params.getint('cpu_kernels', fallback=4),
                                              abaq_params.getint('timeout', fallback=300),
-                                             abaq_params.getint('reader_version', fallback=0))
+                                             abaq_params.getint('reader_version', fallback=0),
+                                             abaq_forcekill=abaq_params.getboolean('abaq_forcekill', fallback=False))
         else:
             raise NotImplementedError
 

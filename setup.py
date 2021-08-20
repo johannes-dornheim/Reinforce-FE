@@ -12,7 +12,7 @@ setup(
         'numpy>=1.15',
         'scipy>=1.1',
         'imageio >= 2',
-        'scikit-learn >= 0.20', 'matplotlib'
+        'scikit-learn >= 0.20', 'matplotlib', 'pyglet'
     ],
     packages=["gym_fem", "gym_fem.envs", "gym_fem.examples.agents"],
     include_package_data=True
