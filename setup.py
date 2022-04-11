@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='gym_fem',
-    version='0.1',
+    version='0.2',
     keywords='rl, environment, openaigym, openai-gym, gym, optimal control, finite element method',
     author="Johannes Dornheim",
     author_email='johannes.dornheim@hs-karlsruhe.de',

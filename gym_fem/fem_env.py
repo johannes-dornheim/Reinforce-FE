@@ -3,18 +3,22 @@ from gym_fem.helpers import CSVLogger
 
 import gym
 from gym.utils import seeding
-from gym.core import Wrapper
+from gym import spaces
+from gym.core import Wrapper, ActionWrapper
 
+from pathlib import Path
 import numpy as np
 from collections.abc import Iterable
 from abc import ABC
-from pathlib import Path
 import configparser
 import inspect
 import imageio
 import time
 import logging
 import shutil
+from datetime import datetime
+import warnings
+import pandas as pd
 
 class FEMEnv(gym.Env, ABC):
     """ abstract class for fem-based environments
@@ -24,6 +28,9 @@ class FEMEnv(gym.Env, ABC):
 
     # environment-id: used as GYM-environment name and for template-paths and simulation-storage-paths
     ENV_ID = None
+
+    # if defined by environment, simulations from the specified environment are used
+    SIM_BASIS = None
 
     # readable names for individual actions, used for solver-templates
     action_names = []
@@ -37,19 +44,23 @@ class FEMEnv(gym.Env, ABC):
 
     # FEM-engine used (e.g. "Abaq")
     fem_engine = None
+    _fem_wrapper = None
 
     # reward given if the simulation is not solvable
-    _not_solvable_reward = 0
+    _SIM_ERROR_REWARD = 0
 
     # img used for rgb-, and human rendering when no image is available
-    _standard_img = np.zeros((731, 914, 3), dtype=np.uint8)
+    _standard_img = None
+    _standard_img_size = None
+
 
     def __init__(self):
         # current episode
         self.episode = 0
         # current time-step
         self.time_step = 0
-
+        self.simulation_failed = False
+        self._init_obsspace = self.observation_space
         # data returned by step(self, action) for 'FEMLogger' or for special purposes like multiobjective-Learning
         # label prefix conventions to enable generic visualization / agents etc.:
         # rt: reward-term
@@ -59,6 +70,7 @@ class FEMEnv(gym.Env, ABC):
         # parameters filled into the solver-template before simulation and used to set the simulation-id
         self.simulation_parameters = {}
 
+        self._curr_fem_results = None
         # used for restart-simulations
         self._root_simulation_id = None
         self._base_simulation_id = None
@@ -68,7 +80,8 @@ class FEMEnv(gym.Env, ABC):
         self.seed()
 
         self.viewer = None
-        self.state_img_path = None
+        self.curr_img_path = None
+        self.img_ts = -1
 
         # read config
         config = configparser.ConfigParser()
@@ -77,46 +90,32 @@ class FEMEnv(gym.Env, ABC):
 
         self.persistent_simulation = general_config.getboolean('persistent_simulation')
         self.visualize = general_config.getboolean('visualize')
-
+        self.reuse_results = general_config.getboolean('reuse_results')
         storage = general_config.get('simulation_storage', fallback=None)
 
         # determine paths for current environment
         if self.persistent_simulation:
-            if storage in [None, '', 'None']:
-                self.sim_storage = Path(f'/tmp/gym_fem/{self.ENV_ID}')
+            if self.SIM_BASIS is not None:
+                sim_str = self.SIM_BASIS
             else:
-                self.sim_storage = Path(f'{storage}/{self.ENV_ID}')
+                sim_str = self.ENV_ID
+
+            if storage in [None, '', 'None']:
+                self.sim_storage = Path(f'~/tmp/sim_storage/{sim_str}')
+            else:
+                self.sim_storage = Path(f'{storage}/{sim_str}')
         else:
-            i = 0
-            self.sim_storage = Path(f'{storage}/tmp/{self.ENV_ID}_{i}')
-            while self.sim_storage.exists():
-                i += 1
-                self.sim_storage = Path(f'{storage}/tmp/{self.ENV_ID}_{i}')
+            t_string = datetime.now().strftime('%y%m%d_%H_%M')
+            self.sim_storage = Path(f'{storage}/{self.ENV_ID}_{t_string}')
             logging.info(f'persistence off, creating temporary simulation-storage: {self.sim_storage}')
-
-
         self.sim_storage.mkdir(exist_ok=True, parents=True)
 
-        # read abaqus specific config
-        if self.fem_engine == 'Abaq':
-            abaq_params = config['abaqus parameters']
+        self._state_log = None
+        if general_config.getboolean('store_state_data'):
+            self._state_log = Path(f'{self.sim_storage}/raw_state_reward_log.log')
 
-            template_folder = Path(__file__).parent.joinpath(f'assets/abaqus_models/{self.ENV_ID}')
-
-            solver_path = abaq_params.get('solver_path')
-            if solver_path in ['', 'None']:
-                solver_path = None
-
-            self.fem_wrapper = AbaqusWrapper(self.sim_storage,
-                                             template_folder,
-                                             solver_path,
-                                             abaq_params.get('abaq_version'),
-                                             abaq_params.getint('cpu_kernels', fallback=4),
-                                             abaq_params.getint('timeout', fallback=300),
-                                             abaq_params.getint('reader_version', fallback=0),
-                                             abaq_forcekill=abaq_params.getboolean('abaq_forcekill', fallback=False))
-        else:
-            raise NotImplementedError
+        # store config for specific environment initialization
+        self.config = config
 
     def step(self, action):
         """
@@ -146,61 +145,80 @@ class FEMEnv(gym.Env, ABC):
         self.info.update(process_conditions)
 
         # create simulation-id (for file- and folder-names) from simulation-parameters
-        simulation_id = self._simulation_id_templates[self.time_step].format(**self.simulation_parameters)
+        format_dict = self.simulation_parameters.copy()
+        format_dict['ts'] = datetime.now().strftime('%m-%d_%H-%M-%S-%f')
+        simulation_id = self._simulation_id_templates[self.time_step].format(**format_dict)
+        self.info['sim_id'] = simulation_id
         logging.debug(simulation_id)
-        i = 1
 
         # wait while simulation is locked
-        while not self.fem_wrapper.request_lock(simulation_id):
+        i = 1
+        while not self._fem_wrapper.request_lock(simulation_id):
             logging.warning(f'waiting for lock release {simulation_id}')
             time.sleep(2 ** i)
             i += 1
 
+        self.simulation_failed = False
         try:
             # check simulation store for results, if none available: simulate
-            if self.fem_wrapper.simulation_results_available(simulation_id):
+            if self._fem_wrapper.simulation_results_available(simulation_id) and self.reuse_results:
                 pass
             else:
                 # run simulation
-                self.fem_wrapper.run_simulation(simulation_id,
-                                                self.simulation_parameters,
-                                                self.time_step,
-                                                self._base_simulation_id)
+                self._fem_wrapper.run_simulation(simulation_id=simulation_id,
+                                                 simulation_parameters=self.simulation_parameters,
+                                                 time_step=self.time_step,
+                                                 base_simulation_id=self._base_simulation_id)
         except SimulationError:
-            logging.warning(f'{simulation_id} not solvable!')
-            o = np.zeros(3)
-            r = 0
+            self.simulation_failed = True
+            o = self._apply_observation_function(None)
+            r = self._calc_sim_error_reward()
+            logging.warning(f'{simulation_id} not solvable! Throwing Reward {r}')
+            self._curr_fem_results = None
             done = True
         else:
             # read FEM-results
-            fem_results = self.fem_wrapper.read_simulation_results(simulation_id,
-                                                                   root_simulation_id=self._root_simulation_id)
+            fem_results = self._fem_wrapper.read_simulation_results(simulation_id,
+                                                                    root_simulation_id=self._root_simulation_id)
+            self._curr_fem_results = fem_results
 
+            done = self._is_done(fem_results[0]) or self._fem_wrapper.is_terminal_state(simulation_id)
             # apply reward function
-            r = self._apply_reward_function(fem_results)
+            r = self._apply_reward_function(fem_results, done)
             # apply observation function
             o = self._apply_observation_function(fem_results)
-            # visualize
-            if self.visualize:
-                self.state_img_path = self.fem_wrapper.get_state_visualization(simulation_id)
-                self.render()
-            done = self._is_done()
+
+            if self._state_log is not None:
+                # create log entry
+                raw_data = np.append(self._get_state_vector(fem_results), r)
+                # append log
+                with open(self._state_log, 'a') as log_handle:
+                    np.savetxt(log_handle, raw_data, newline=",")
+                    log_handle.write(f',{simulation_id}\n')
+        self._fem_wrapper.release_lock(simulation_id)
 
         if self.time_step == 0:
             self._root_simulation_id = simulation_id
         self._base_simulation_id = simulation_id
 
-        self.time_step += 1
         if done:
-            episode_string = f'{self.episode}: Reward {r}, Trajectory {simulation_id}'
+            self.info['sim_id'] = simulation_id
+            episode_string = f'{self.episode}: Reward {r}, Trajectory {simulation_id} | ' \
+                                     f'rf {self.info["rt_feeding"]} rt {self.info["rt_thickness"]} ' \
+                                     f'rvm {self.info["rt_v_mises"]}'
             # print(colorize(episode_string, 'green', bold=True))
             logging.info(episode_string)
 
-        self.fem_wrapper.release_lock(simulation_id)
+        self.info['episode'] = self.episode
 
+        self.time_step += 1
         return o, r, done, self.info
 
-    def _apply_reward_function(self, fem_results):
+    def _calc_sim_error_reward(self):
+        return self._SIM_ERROR_REWARD
+
+
+    def _apply_reward_function(self, fem_results, done):
         """ to be implemented by special FEMEnv instance (use random numbers seeded in seed())
         Args:
             fem_results (tuple): tuple of pandas dataframes for element-wise- and node-wise results
@@ -226,11 +244,22 @@ class FEMEnv(gym.Env, ABC):
         """
         raise NotImplementedError
 
-    def _is_done(self):
+    def _is_done(self, state=None):
         """ to be implemented by special FEMEnv instance, returns True if the current State is a terminal-state
         Returns:
             done (bool):
                 dictionary with process-conditions (Keys used have to be identical with abaq-template keys)
+        """
+        raise NotImplementedError
+
+    def _get_state_vector(self, fem_results):
+        """to be implemented by special FEMEnv instance, returns state values in vector form for fem_results tuple
+        Args:
+            fem_results: usually an (element-data, node-data) tuple
+        Returns:
+            state_vec (np.array):
+                vector representation of specific fem_results
+
         """
         raise NotImplementedError
 
@@ -257,11 +286,21 @@ class FEMEnv(gym.Env, ABC):
             mode (str): the mode to render with
         """
         if self.visualize:
-            if self.state_img_path is None:
-                return self._standard_img
+            if self.img_ts != self.time_step:
+                self.curr_img_path = self._render_state()
+                self.img_ts = self.time_step
 
-            img = imageio.imread(self.state_img_path, pilmode='RGB')
+            if self.curr_img_path is None:
+                img = self._standard_img
+            else:
+                img = imageio.imread(self.curr_img_path, pilmode='RGB')
+
             if mode == 'rgb_array':
+                if img.shape != self._standard_img_size:
+                    logging.debug(f'wrong img-shape {img.shape}, expected {self._standard_img_size}')
+                    img_ = np.zeros(self._standard_img_size, dtype=np.uint8)
+                    img_[:img.shape[0], :img.shape[1], :] = img
+                    img = img_
                 return img
             if mode == 'human':
                 from gym.envs.classic_control import rendering
@@ -270,7 +309,15 @@ class FEMEnv(gym.Env, ABC):
                 self.viewer.imshow(img)
                 return self.viewer.isopen
 
-        super(FEMEnv, self).render(mode=mode)
+
+    def _render_state(self):
+        try:
+            state_img_path = self._fem_wrapper.get_state_visualization(simulation_id=self._base_simulation_id,
+                                                                       time_step=self.time_step)
+        except Exception as e:
+            warnings.warn(f'problem during visualization {str(e)}')
+            return None
+        return state_img_path
 
     def seed(self, seed=None):
         """Sets the seed for this env's random number generator(s).
@@ -296,9 +343,6 @@ class FEMEnv(gym.Env, ABC):
         Environments will automatically close() themselves when
         garbage collected or when the program exits.
         """
-        if not self.persistent_simulation:
-            shutil.rmtree(self.sim_storage)
-
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None
@@ -325,42 +369,80 @@ class PseudoContinuousActions(ActionWrapper):
         return (np.abs(self.action_values - action)).argmin()
 """
 
+
 class FEMCSVLogger(Wrapper):
     """
     Specific csv-file logger for fem-environments. Complements the default gym monitor / stats_recorder.
     """
 
-    def __init__(self, env, outdir):
+    def __init__(self, env, outdir, logmode='per_episode'):
+        """
+        Args:
+            env: fem-environment
+            outdir: dir. to log to
+            logmode: in {per_episode, per_step} determines the scope of a single log entry.
+        """
         assert (type(env) in inspect.getmro(type(env))), \
             f"FEMLogger Wrapper is defined for Environments of type FEMEnv, " \
             f"given: {inspect.getmro(type(env))}"
+        assert(logmode in ['per_episode', 'per_step']), 'logmode string has to be one of {per_episode, per_step}'
         self._iteration_start = time.time()
         self._accumulated_reward = 0
+        self._logmode = logmode
 
         outdir = Path(outdir)
         outdir.mkdir(exist_ok=True, parents=True)
         log_file = outdir.joinpath('env_log.csv')
+
         if log_file.exists():
             logging.warning(f'{log_file} already existent!')
         self._logger = CSVLogger(log_file)
 
+        # special episode log-file, used when logmode == per_step
+        self._episode_logger = None
+        if logmode == 'per_step':
+            episode_log_file = outdir.joinpath('episode_env_log.csv')
+            self._episode_logger = CSVLogger(episode_log_file)
         super().__init__(env)
 
     def step(self, action):
         o, r, done, info = super().step(action)
         self._accumulated_reward += r
 
-        try:
-            for i, a in enumerate(action):
-                self._logger.set_value(f'action{i}_{self.time_step}', a)
-        except TypeError:
-            self._logger.set_value(f'action{self.time_step}', action)
-        self._logger.set_value(f'reward{self.time_step}', r)
-        self._logger.set_values(info)
-
-        if done:
-            self._set_episode_log_vals()
+        if self._logmode == 'per_episode':
+            try:
+                for i, a in enumerate(action):
+                    self._logger.set_value(f'action{i}_{self.time_step}', a)
+            except TypeError:
+                self._logger.set_value(f'action{self.time_step}', action)
+            self._logger.set_value(f'reward{self.time_step}', r)
+            self._logger.set_values(info)
+            if done:
+                self._set_episode_log_vals()
+                self._logger.write_log()
+        else:
+            # write step log
+            self._logger.set_value('time-step', self.time_step)
+            self._logger.set_value(f'reward', r)
+            try:
+                for i, a in enumerate(action):
+                    self._logger.set_value(f'action{i}', a)
+            except TypeError:
+                self._logger.set_value(f'action{self.time_step}', action)
+            self._logger.set_value('done', done)
+            self._logger.set_values(info)
             self._logger.write_log()
+
+            # write episode log
+            if done:
+                self._set_episode_log_vals()
+                self._episode_logger.set_value('total_steps', self.time_step)
+                if 'episode_goal' in info.keys():
+                    self._episode_logger.set_value('goal', info['episode_goal'])
+                for k in info.keys():
+                    if k.startswith('episode_'):
+                        self._episode_logger.set_value(k, info[k])
+                self._episode_logger.write_log()
 
         return o, r, done, info
 
@@ -376,6 +458,12 @@ class FEMCSVLogger(Wrapper):
 
     def _set_episode_log_vals(self):
         runtime = time.time() - self._iteration_start
-        self._logger.set_value('iteration', int(self.episode))
-        self._logger.set_value('runtime', runtime)
-        self._logger.set_value('reward', self._accumulated_reward)
+        if self._logmode == 'per_episode':
+            self._logger.set_value('iteration', int(self.episode))
+            self._logger.set_value('runtime', runtime)
+            self._logger.set_value('reward', self._accumulated_reward)
+        elif self._logmode == 'per_step':
+            self._episode_logger.set_value('episode', int(self.episode))
+            self._episode_logger.set_value('runtime', runtime)
+            self._episode_logger.set_value('reward', self._accumulated_reward)
+
